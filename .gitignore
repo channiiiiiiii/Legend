@@ -1,0 +1,39 @@
+# 🔒 시크릿 & 환경변수
+.env
+bot_config.json
+
+# 📦 Node / Supabase CLI
+node_modules/
+package.json
+package-lock.json
+
+# 💾 로컬 세이브 (Supabase 이전 완료)
+discord_saves/
+save_data.json
+save_data.bak
+pet_storage.json
+
+# 🐍 Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# 🛠️ IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 📦 Supabase
+supabase/.temp/
+
+# 🗂️ 백업 & 테스트
+backup/
+test_supabase.py
+docs/
