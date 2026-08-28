@@ -39,8 +39,8 @@ class Minigames:
                     print("📈 UP! 더 큰 숫자입니다!")
                 else:
                     print("📉 DOWN! 더 작은 숫자입니다!")
-            except Exception:
-                pass
+            except ValueError:
+                continue
         
         pet.happiness = min(100, pet.happiness + 10)
         return 30, 10, f"😢 아쉽게도 기회를 모두 소진했습니다. 정답은 [{target}]이었습니다!"

@@ -39,8 +39,8 @@ class SaveManager:
                     with open(SAVE_FILE_PATH, "r", encoding="utf-8") as f_src:
                         with open(BACKUP_FILE_PATH, "w", encoding="utf-8") as f_dst:
                             f_dst.write(f_src.read())
-                except Exception:
-                    pass
+                except (OSError, UnicodeError) as backup_error:
+                    print(f"[SAVE BACKUP ERROR] {type(backup_error).__name__}: {backup_error}")
             
             # JSON 저장
             with open(SAVE_FILE_PATH, "w", encoding="utf-8") as f:
@@ -77,7 +77,8 @@ class SaveManager:
                         data["elapsed_seconds"] = 0
                         data["elapsed_minutes"] = 0
                         return data
-                except Exception:
+                except (OSError, json.JSONDecodeError, TypeError) as backup_error:
+                    print(f"[SAVE RESTORE ERROR] {type(backup_error).__name__}: {backup_error}")
                     return None
             return None
 

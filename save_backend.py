@@ -41,6 +41,14 @@ CURRENT_SAVE_VERSION = 18
 _supabase = None
 
 
+class SaveBackendUnavailable(RuntimeError):
+    """저장소 조회 자체가 실패하여 신규/기존 사용자를 판별할 수 없는 상태."""
+
+
+class SaveVersionUnsupported(SaveBackendUnavailable):
+    """현재 코드보다 미래 버전인 세이브의 안전한 로드 중단."""
+
+
 def get_supabase():
     """Supabase 클라이언트 싱글턴 반환 (세이브할 때마다 새로 생성하지 않는다)"""
     global _supabase
@@ -57,9 +65,41 @@ def get_supabase():
     return _supabase
 
 
+def validate_backend_config() -> None:
+    """운영 백엔드 설정 누락을 네트워크 요청 전에 검증한다."""
+    if SAVE_BACKEND not in {"json", "supabase"}:
+        raise RuntimeError(f"지원하지 않는 SAVE_BACKEND: {SAVE_BACKEND!r}")
+    if SAVE_BACKEND == "supabase":
+        missing = [
+            name for name, value in (
+                ("SUPABASE_URL", SUPABASE_URL),
+                ("SUPABASE_SECRET_KEY", SUPABASE_SECRET_KEY),
+            )
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                "Supabase 운영 환경변수가 누락되었습니다: " + ", ".join(missing)
+            )
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 세이브 버전 마이그레이션
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _migrate_v17_to_v18(data: dict) -> dict:
+    data["save_version"] = 18
+    inv = data.get("inventory", {})
+    eq_armor = inv.get("equipped_armor")
+    if eq_armor and eq_armor.get("armor_id") == "ancient_god_armor":
+        eq_armor["armor_id"] = "mythic_celestial_armor"
+    return data
+
+
+SAVE_MIGRATIONS = {
+    17: _migrate_v17_to_v18,
+}
+
+
 def migrate_save(data: dict) -> dict:
     """
     세이브 데이터를 최신 버전으로 자동 마이그레이션
@@ -67,18 +107,25 @@ def migrate_save(data: dict) -> dict:
     - 기존 유저 데이터에 값이 없어도 자동으로 기본값을 사용한다
     """
     version = data.get("save_version", 17)
+    if not isinstance(version, int):
+        raise SaveVersionUnsupported(f"잘못된 save_version 형식: {version!r}")
+    if version > CURRENT_SAVE_VERSION:
+        print(
+            f"[SAVE VERSION ERROR] future={version} current={CURRENT_SAVE_VERSION}"
+        )
+        raise SaveVersionUnsupported(
+            f"미래 세이브 버전 v{version}은 현재 v{CURRENT_SAVE_VERSION}에서 지원되지 않습니다."
+        )
 
-    if version < 18:
-        # v17 → v18: save_version 필드 추가 (구조 변경 없음, 버전 태깅만)
-        data["save_version"] = 18
+    while version < CURRENT_SAVE_VERSION:
+        migration = SAVE_MIGRATIONS.get(version)
+        if migration is None:
+            raise SaveVersionUnsupported(
+                f"v{version} 마이그레이션 단계가 정의되지 않았습니다."
+            )
+        data = migration(data)
+        version = data["save_version"]
 
-        # 구버전 방어구 ID 호환 처리
-        inv = data.get("inventory", {})
-        eq_armor = inv.get("equipped_armor")
-        if eq_armor and eq_armor.get("armor_id") == "ancient_god_armor":
-            eq_armor["armor_id"] = "mythic_celestial_armor"
-
-    data["save_version"] = CURRENT_SAVE_VERSION
     return data
 
 
@@ -118,12 +165,19 @@ def save_to_json(user_id: str, save_data: dict) -> bool:
                 os.fsync(f.fileno())
             os.replace(temp_path, path)
             return True
-        except Exception:
+        except (OSError, TypeError, ValueError) as e:
+            print(
+                f"[JSON SAVE ERROR] user={user_id} attempt={attempt + 1}/3 "
+                f"/ {type(e).__name__}: {ascii(str(e))}"
+            )
             if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
-                except Exception:
-                    pass
+                except OSError as cleanup_error:
+                    print(
+                        f"[JSON TEMP CLEANUP ERROR] {type(cleanup_error).__name__}: "
+                        f"{ascii(str(cleanup_error))}"
+                    )
             if attempt == 2:
                 try:
                     with open(path, "w", encoding="utf-8") as f:
@@ -153,27 +207,35 @@ def load_from_supabase(user_id: str) -> dict | None:
             return None
         return result.data[0]["save_data"]
     except Exception as e:
-        print(f"❌ Supabase 로드 에러: user={user_id} / {e}")
-        return None
+        print(f"[SUPABASE LOAD ERROR] user={user_id} / {type(e).__name__}: {ascii(str(e))}")
+        raise SaveBackendUnavailable(
+            f"Supabase에서 user={user_id} 세이브를 조회하지 못했습니다."
+        ) from e
 
 
 def save_to_supabase(user_id: str, save_data: dict) -> bool:
     """Supabase user_saves 테이블에 UPSERT 저장"""
-    try:
-        db = get_supabase()
-        payload = {
-            "user_id": str(user_id),
-            "save_data": save_data,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }
-        db.table("user_saves").upsert(
-            payload,
-            on_conflict="user_id"
-        ).execute()
-        return True
-    except Exception as e:
-        print(f"❌ Supabase 세이브 에러: user={user_id} / {e}")
-        return False
+    payload = {
+        "user_id": str(user_id),
+        "save_data": save_data,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    for attempt in range(3):
+        try:
+            db = get_supabase()
+            db.table("user_saves").upsert(
+                payload,
+                on_conflict="user_id"
+            ).execute()
+            return True
+        except Exception as e:
+            print(
+                f"[SUPABASE SAVE ERROR] user={user_id} "
+                f"attempt={attempt + 1}/3 / {type(e).__name__}: {ascii(str(e))}"
+            )
+            if attempt < 2:
+                time.sleep(0.1 * (2 ** attempt))
+    return False
 
 
 def delete_from_supabase(user_id: str) -> bool:

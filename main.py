@@ -14,8 +14,8 @@ if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding='utf-8')
         sys.stderr.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
+    except (AttributeError, OSError) as e:
+        print(f"[CONSOLE ENCODING ERROR] {type(e).__name__}: {e}", file=sys.stderr)
     import msvcrt
 else:
     msvcrt = None
@@ -620,8 +620,8 @@ def get_input_with_timeout(timeout=2.5) -> str:
             ch = msvcrt.getch()
             try:
                 return ch.decode('utf-8')
-            except Exception:
-                pass
+            except UnicodeDecodeError:
+                continue
         time.sleep(0.05)
     return None
 

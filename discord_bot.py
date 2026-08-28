@@ -16,6 +16,8 @@ import time
 import sys
 import asyncio
 import random
+import traceback
+from functools import wraps
 from datetime import datetime
 
 # 🌐 Render 배포용 .env 환경변수 로드
@@ -38,7 +40,10 @@ from adventure import (
 )
 from achievements import AchievementManager, ACHIEVEMENTS_DATABASE
 from storage import StorageManager, PetMarket
-from save_backend import load_user_save, save_user_save, delete_user_save, get_backend_info, SAVE_BACKEND
+from save_backend import (
+    SaveBackendUnavailable, load_user_save, save_user_save,
+    delete_user_save, get_backend_info, validate_backend_config, SAVE_BACKEND
+)
 
 CONFIG_FILE = os.path.join(PROJECT_ROOT, "bot_config.json")
 SAVES_DIR = os.path.join(PROJECT_ROOT, "discord_saves")
@@ -203,8 +208,8 @@ def load_token() -> str:
                     ""
                 )
                 return token.strip()
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[CONFIG ERROR] {type(e).__name__}: {ascii(str(e))}")
     return ""
 
 def get_user_save_path(user_id: int) -> str:
@@ -234,6 +239,9 @@ def get_or_create_user_pet(user_id: int) -> tuple[Pet, Inventory, dict, str]:
             return pet, inv, meta, msg
         except Exception as e:
             print(f"⚠️ 세이브 복원 에러 (user={user_id}): {e}")
+            raise SaveBackendUnavailable(
+                f"user={user_id} 세이브 데이터 복원에 실패했습니다."
+            ) from e
     
     # 신규 유저 → 새 신수 생성
     pet = Pet()
@@ -255,14 +263,45 @@ def save_user_pet(user_id: int, pet: Pet, inv: Inventory, meta: dict) -> bool:
         "meta": meta
     }
     try:
-        return save_user_save(str(user_id), payload)
+        if not save_user_save(str(user_id), payload):
+            raise SaveBackendUnavailable(
+                f"user={user_id} 세이브 저장이 최종 실패했습니다."
+            )
+        return True
+    except SaveBackendUnavailable:
+        raise
     except Exception as e:
         print(f"❌ DB SAVE ERROR: user={user_id} / {e}")
-        return False
+        raise SaveBackendUnavailable(
+            f"user={user_id} 세이브 저장 중 예외가 발생했습니다."
+        ) from e
 
 def create_bar(val: int, max_val: int = 100, length: int = 8) -> str:
     filled = max(0, min(length, int((val / max(1, max_val)) * length)))
     return "█" * filled + "░" * (length - filled)
+
+class ReentrantAsyncLock:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._owner = None
+        self._depth = 0
+
+    async def __aenter__(self):
+        task = asyncio.current_task()
+        if self._owner is task:
+            self._depth += 1
+            return self
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
 
 class UserActionQueue:
     """
@@ -271,14 +310,23 @@ class UserActionQueue:
     - 유저별 독립 Lock과 큐를 통해 멀티유저 및 멀티채널 요청을 안전하게 직렬화/병렬 처리
     """
     def __init__(self):
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._locks: dict[int, ReentrantAsyncLock] = {}
 
-    def get_lock(self, user_id: int) -> asyncio.Lock:
+    def get_lock(self, user_id: int) -> ReentrantAsyncLock:
         if user_id not in self._locks:
-            self._locks[user_id] = asyncio.Lock()
+            self._locks[user_id] = ReentrantAsyncLock()
         return self._locks[user_id]
 
 USER_ACTION_QUEUE = UserActionQueue()
+SAVE_UNAVAILABLE_MESSAGE = "저장 서버 연결이 불안정합니다. 잠시 후 다시 시도해 주세요."
+
+
+def serialized_user_action(func):
+    @wraps(func)
+    async def wrapper(interaction: discord.Interaction, *args, **kwargs):
+        async with USER_ACTION_QUEUE.get_lock(interaction.user.id):
+            return await func(interaction, *args, **kwargs)
+    return wrapper
 
 def is_damagochi_channel(channel) -> bool:
     """신수키우기 1채널, 2채널 및 모든 서버 채널/DM에서 100% 자유롭게 작동하도록 완전 개방"""
@@ -2286,15 +2334,26 @@ class HybridBattleView(discord.ui.View):
         if interaction.user.id != self.session.user.id:
             return await interaction.response.send_message("본인의 전투만 조작할 수 있습니다!", ephemeral=True)
 
+        await interaction.response.defer()
+        try:
+            async with USER_ACTION_QUEUE.get_lock(self.session.user.id):
+                await self._handle_action_after_defer(interaction, action)
+        except Exception as e:
+            print(f"[RAID ERROR] {type(e).__name__}: {e}")
+            traceback.print_exc()
+            try:
+                await interaction.followup.send(
+                    "레이드 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+                    ephemeral=True
+                )
+            except Exception as followup_error:
+                print(f"[RAID ERROR] 오류 응답 전송 실패: {type(followup_error).__name__}: {followup_error}")
+                traceback.print_exc()
+
+    async def _handle_action_after_defer(self, interaction: discord.Interaction, action: str):
         suc, log_text = self.session.process_turn(action)
-        save_user_pet(self.session.user.id, self.session.pet, self.session.inv, self.meta)
-        
-        self.rebuild_buttons()
-        embed, files_att = self.session.get_battle_embed(log_text)
+        result_field = None
         if self.session.is_finished:
-            for item in self.children:
-                item.disabled = True
-            
             diff_id = getattr(self.session, "diff_id", 1)
             if suc:
                 # 🏥 전투 후 잔여 HP 비율을 신수의 건강(Health)에 보존 반영 (즉시 100% 리셋 방지)
@@ -2374,51 +2433,60 @@ class HybridBattleView(discord.ui.View):
                         self.meta["cleared_bosses"] = c_bosses
 
                 ach_logs = AchievementManager.check_and_claim(self.session.pet, self.session.inv, self.meta)
-                save_user_pet(self.session.user.id, self.session.pet, self.session.inv, self.meta)
                 
                 drop_str = f"\n📦 **핵심 드랍:**\n• " + "\n• ".join(drop_logs) if drop_logs else ""
                 clear_gate_str = ("\n\n" + "\n".join(clear_logs)) if clear_logs else ""
                 ach_str = ("\n\n" + "\n".join(ach_logs)) if ach_logs else ""
                 health_str = f"\n🏥 **전투 후 건강:** `{post_health}%` _(수면/치료약/사료로 회복 가능)_"
-                embed.add_field(name="🎁 토벌 보상", value=f"💰 +{b_gold:,}G | ✨ +{b_exp:,} EXP{health_str}{drop_str}\n" + " ".join(exp_logs) + clear_gate_str + ach_str, inline=False)
+                result_field = (
+                    "🎁 토벌 보상",
+                    f"💰 +{b_gold:,}G | ✨ +{b_exp:,} EXP{health_str}{drop_str}\n"
+                    + " ".join(exp_logs) + clear_gate_str + ach_str
+                )
             else:
-                # 💀 패배 결과 처리 및 상태 저장 (치명상/건강/기력)
-                save_user_pet(self.session.user.id, self.session.pet, self.session.inv, self.meta)
                 fail_status = "💀 [치명상/전투 불능]" if getattr(self.session.pet, "is_critically_injured", False) else "🤕 [체력 소진/패배]"
-                embed.add_field(
-                    name="💀 레이드 토벌 실패...",
-                    value=f"**{self.session.pet.name}**의 체력이 모두 소진되었습니다. {fail_status}\n🏥 _(건강이 낮아지면 치료나 휴식이 필요합니다)_",
-                    inline=False
+                result_field = (
+                    "💀 레이드 토벌 실패...",
+                    f"**{self.session.pet.name}**의 체력이 모두 소진되었습니다. {fail_status}\n"
+                    "🏥 _(건강이 낮아지면 치료나 휴식이 필요합니다)_"
                 )
 
-            try:
-                if interaction.response.is_done():
-                    if files_att:
-                        await interaction.edit_original_response(embed=embed, attachments=files_att, view=self)
-                    else:
-                        await interaction.edit_original_response(embed=embed, view=self)
-                else:
-                    if files_att:
-                        await interaction.response.edit_message(embed=embed, attachments=files_att, view=self)
-                    else:
-                        await interaction.response.edit_message(embed=embed, view=self)
+        try:
+            # 잡지식: 동기 네트워크 I/O는 스레드로 보내야 이벤트 루프가 숨을 쉽니다.
+            await asyncio.to_thread(
+                save_user_pet,
+                self.session.user.id,
+                self.session.pet,
+                self.session.inv,
+                self.meta
+            )
+            self.rebuild_buttons()
+            embed, files_att = self.session.get_battle_embed(log_text)
+
+            if self.session.is_finished:
+                for item in self.children:
+                    item.disabled = True
+                if result_field:
+                    embed.add_field(name=result_field[0], value=result_field[1], inline=False)
+
+            if files_att:
+                await interaction.edit_original_response(embed=embed, attachments=files_att, view=self)
+            else:
+                await interaction.edit_original_response(embed=embed, view=self)
+
+            if self.session.is_finished:
                 await interaction.followup.send("🏁 전투가 종료되었습니다. 이 스레드는 잠시 후 보관됩니다.")
-            except Exception:
-                pass
-        else:
+        except Exception as e:
+            print(f"[RAID ERROR] {type(e).__name__}: {e}")
+            traceback.print_exc()
             try:
-                if interaction.response.is_done():
-                    if files_att:
-                        await interaction.edit_original_response(embed=embed, attachments=files_att, view=self)
-                    else:
-                        await interaction.edit_original_response(embed=embed, view=self)
-                else:
-                    if files_att:
-                        await interaction.response.edit_message(embed=embed, attachments=files_att, view=self)
-                    else:
-                        await interaction.response.edit_message(embed=embed, view=self)
-            except Exception:
-                pass
+                await interaction.followup.send(
+                    "레이드 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+                    ephemeral=True
+                )
+            except Exception as followup_error:
+                print(f"[RAID ERROR] 오류 응답 전송 실패: {type(followup_error).__name__}: {followup_error}")
+                traceback.print_exc()
 
 class DamagochiView(discord.ui.View):
     """
@@ -2680,6 +2748,8 @@ class DamagochiView(discord.ui.View):
             self.add_item(discord.ui.Button(label="🏠 메인으로", style=discord.ButtonStyle.primary, custom_id="btn_back_main", row=0))
 
     async def update_view(self, interaction: discord.Interaction, action_msg: str = ""):
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with USER_ACTION_QUEUE.get_lock(self.user.id):
             old_stage = get_growth_stage(self.pet.level)
             self.pet.live_tick()
@@ -2692,7 +2762,10 @@ class DamagochiView(discord.ui.View):
             if ach_logs:
                 action_msg += "\n" + "\n".join(ach_logs)
                 
-            save_user_pet(self.user.id, self.pet, self.inv, self.meta)
+            if not await save_user_pet_or_notify(
+                interaction, self.user.id, self.pet, self.inv, self.meta
+            ):
+                return
             self.rebuild_ui()
             
             file_att = None
@@ -2748,7 +2821,8 @@ class DamagochiView(discord.ui.View):
                     if file_att:
                         try:
                             await interaction.response.edit_message(embed=embed, attachments=[file_att], view=self)
-                        except Exception:
+                        except (discord.NotFound, discord.HTTPException) as e:
+                            print(f"[DISCORD ATTACHMENT ERROR] {type(e).__name__}: {e}")
                             await interaction.response.edit_message(embed=embed, view=self)
                     else:
                         await interaction.response.edit_message(embed=embed, view=self)
@@ -2756,7 +2830,8 @@ class DamagochiView(discord.ui.View):
                     if file_att:
                         try:
                             await interaction.edit_original_response(embed=embed, attachments=[file_att], view=self)
-                        except Exception:
+                        except (discord.NotFound, discord.HTTPException) as e:
+                            print(f"[DISCORD ATTACHMENT ERROR] {type(e).__name__}: {e}")
                             await interaction.edit_original_response(embed=embed, view=self)
                     else:
                         await interaction.edit_original_response(embed=embed, view=self)
@@ -2767,6 +2842,10 @@ class DamagochiView(discord.ui.View):
                 traceback.print_exc()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        async with USER_ACTION_QUEUE.get_lock(interaction.user.id):
+            return await self._interaction_check_serialized(interaction)
+
+    async def _interaction_check_serialized(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user.id:
             await interaction.response.send_message(
                 f"💡 이 화면은 **{self.user.display_name}**님의 신수 대시보드입니다!\n"
@@ -2888,6 +2967,8 @@ class DamagochiView(discord.ui.View):
 
         # 📌 4-1-1. 던전 난이도 실행 (1~3: 일반/정예/심연)
         elif c_id.startswith("btn_run_dungeon_"):
+            if not interaction.response.is_done():
+                await interaction.response.defer()
             diff_id = int(c_id.split("_")[-1])
             d_id = getattr(self, "selected_dungeon_id", 1)
             d_info = DUNGEON_DATABASE.get(d_id, DUNGEON_DATABASE[1])
@@ -2939,7 +3020,10 @@ class DamagochiView(discord.ui.View):
                 await interaction.response.defer()
 
             self.pet.consume_energy(25, "raid")
-            save_user_pet(self.user.id, self.pet, self.inv, self.meta)
+            if not await save_user_pet_or_notify(
+                interaction, self.user.id, self.pet, self.inv, self.meta
+            ):
+                return False
 
             thread_name = f"⚔️ {self.user.display_name}-vs-{boss_base['name']}-{diff_info['name'].split()[0]}"
 
@@ -3177,7 +3261,6 @@ class DamagochiView(discord.ui.View):
             new_inv.equipped_relic = {"species": new_pet.species_key, "level": 0}
             self.pet = new_pet
             self.inv = new_inv
-            save_user_pet(self.user.id, self.pet, self.inv, self.meta)
             self.view_mode = "main"
             
             shiny_str = "🌟 **[극희귀 황금 샤이니 변이 출현!]**\n" if new_pet.is_shiny else ""
@@ -3446,6 +3529,19 @@ intents = discord.Intents.default()
 # 슬래시 명령어(/다마고치, /채팅정리 등)와 버튼 UI는 기본 Intents만으로 100% 정상 작동합니다.
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+    if not isinstance(original, SaveBackendUnavailable):
+        raise error
+
+    print(f"[SAVE LOAD ERROR] user={interaction.user.id}: {original}")
+    if interaction.response.is_done():
+        await interaction.followup.send(SAVE_UNAVAILABLE_MESSAGE, ephemeral=True)
+    else:
+        await interaction.response.send_message(SAVE_UNAVAILABLE_MESSAGE, ephemeral=True)
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🌐 Render 헬스체크 HTTP 서버 (aiohttp)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3467,9 +3563,9 @@ async def start_health_server():
     async def health_check(request):
         return web.json_response({
             "status": "ok",
-            "service": "damagochi",
             "discord": "ready" if bot.is_ready() else "connecting",
-            "backend": get_backend_info()
+            "save_backend": SAVE_BACKEND,
+            "save_config": "configured"
         })
 
     app = web.Application()
@@ -3498,8 +3594,38 @@ async def delete_after_delay(msg: discord.Message, delay: int = 3):
     await asyncio.sleep(delay)
     try:
         await msg.delete()
-    except Exception:
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+
+
+async def get_user_pet_for_message(message: discord.Message):
+    async with USER_ACTION_QUEUE.get_lock(message.author.id):
+        try:
+            return await asyncio.to_thread(get_or_create_user_pet, message.author.id)
+        except SaveBackendUnavailable as e:
+            print(f"[SAVE LOAD ERROR] user={message.author.id}: {e}")
+            await message.channel.send(SAVE_UNAVAILABLE_MESSAGE)
+            return None
+
+
+async def send_deferred_ephemeral(interaction: discord.Interaction, message: str):
+    try:
+        await interaction.delete_original_response()
+    except discord.NotFound:
         pass
+    await interaction.followup.send(message, ephemeral=True)
+
+
+async def save_user_pet_or_notify(
+    interaction: discord.Interaction, user_id: int, pet: Pet, inv: Inventory, meta: dict
+) -> bool:
+    try:
+        await asyncio.to_thread(save_user_pet, user_id, pet, inv, meta)
+        return True
+    except SaveBackendUnavailable as e:
+        print(f"[SAVE ERROR] user={user_id}: {e}")
+        await interaction.followup.send(SAVE_UNAVAILABLE_MESSAGE, ephemeral=True)
+        return False
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -3529,7 +3655,10 @@ async def on_message(message: discord.Message):
 
     # 3. 신수 메인 대시보드 (!다마고치, 다마고치, !신수, 신수, !상태, 상태)
     if content.startswith(("!다마고치", "다마고치", "!신수", "신수", "!상태", "상태")):
-        pet, inv, meta, msg = get_or_create_user_pet(message.author.id)
+        loaded = await get_user_pet_for_message(message)
+        if loaded is None:
+            return
+        pet, inv, meta, msg = loaded
         embed, file_att = create_main_embed(message.author, pet, inv, msg)
         view = DamagochiView(message.author, pet, inv, meta, view_mode="main")
         if file_att:
@@ -3542,19 +3671,28 @@ async def on_message(message: discord.Message):
         await message.channel.send(embed=embed)
         return
     elif content.startswith(("!가방", "가방", "!인벤", "인벤")):
-        pet, inv, meta, _ = get_or_create_user_pet(message.author.id)
+        loaded = await get_user_pet_for_message(message)
+        if loaded is None:
+            return
+        pet, inv, meta, _ = loaded
         embed = create_bag_embed(message.author, pet, inv)
         view = DamagochiView(message.author, pet, inv, meta, view_mode="bag")
         await message.channel.send(embed=embed, view=view)
         return
     elif content.startswith(("!상점", "상점")):
-        pet, inv, meta, _ = get_or_create_user_pet(message.author.id)
+        loaded = await get_user_pet_for_message(message)
+        if loaded is None:
+            return
+        pet, inv, meta, _ = loaded
         embed = create_shop_embed(message.author, pet, inv)
         view = DamagochiView(message.author, pet, inv, meta, view_mode="shop")
         await message.channel.send(embed=embed, view=view)
         return
     elif content.startswith(("!혈통", "혈통")):
-        pet, inv, meta, _ = get_or_create_user_pet(message.author.id)
+        loaded = await get_user_pet_for_message(message)
+        if loaded is None:
+            return
+        pet, inv, meta, _ = loaded
         embed = create_lineage_embed(message.author, pet, meta)
         view = DamagochiView(message.author, pet, inv, meta, view_mode="lineage")
         await message.channel.send(embed=embed, view=view)
@@ -3574,15 +3712,17 @@ async def cmd_clear(interaction: discord.Interaction, 개수: int = 100):
         await interaction.followup.send(f"⚠️ 메시지 삭제 권한이 부족합니다: {e}", ephemeral=True)
 
 @bot.tree.command(name="다마고치", description="✨ 신수키우기 메인 대시보드를 엽니다.")
+@serialized_user_action
 async def cmd_damagochi(interaction: discord.Interaction):
-    pet, inv, meta, msg = get_or_create_user_pet(interaction.user.id)
+    await interaction.response.defer()
+    pet, inv, meta, msg = await asyncio.to_thread(get_or_create_user_pet, interaction.user.id)
     embed, file_att = create_main_embed(interaction.user, pet, inv, msg)
     view = DamagochiView(interaction.user, pet, inv, meta, view_mode="main")
     
     if file_att:
-        await interaction.response.send_message(embed=embed, file=file_att, view=view)
+        await interaction.edit_original_response(embed=embed, attachments=[file_att], view=view)
     else:
-        await interaction.response.send_message(embed=embed, view=view)
+        await interaction.edit_original_response(embed=embed, view=view)
 
 @bot.tree.command(name="확률표", description="🎲 10대 신수 및 극희귀 변이 소환 공식 확률표를 확인합니다.")
 async def cmd_rates(interaction: discord.Interaction):
@@ -3591,31 +3731,37 @@ async def cmd_rates(interaction: discord.Interaction):
 
 @bot.tree.command(name="이름변경", description="✏️ 내 신수의 이름을 새로운 멋진 닉네임으로 변경합니다.")
 @app_commands.describe(새이름="새로 지어줄 신수의 닉네임 (최대 15자)")
+@serialized_user_action
 async def cmd_rename(interaction: discord.Interaction, 새이름: str):
-    pet, inv, meta, _ = get_or_create_user_pet(interaction.user.id)
+    await interaction.response.defer()
+    pet, inv, meta, _ = await asyncio.to_thread(get_or_create_user_pet, interaction.user.id)
     suc, msg = pet.rename(새이름)
-    save_user_pet(interaction.user.id, pet, inv, meta)
+    await asyncio.to_thread(save_user_pet, interaction.user.id, pet, inv, meta)
     
     embed, file_att = create_main_embed(interaction.user, pet, inv, msg)
     view = DamagochiView(interaction.user, pet, inv, meta, view_mode="main")
     if file_att:
-        await interaction.response.send_message(content=f"🎉 **{msg}**", embed=embed, file=file_att, view=view)
+        await interaction.edit_original_response(content=f"🎉 **{msg}**", embed=embed, attachments=[file_att], view=view)
     else:
-        await interaction.response.send_message(content=f"🎉 **{msg}**", embed=embed, view=view)
+        await interaction.edit_original_response(content=f"🎉 **{msg}**", embed=embed, view=view)
 
 @bot.tree.command(name="혈통", description="🧬 내 가문의 세대별 혈통 계보도 및 역대 최고 IV 기록을 확인합니다.")
+@serialized_user_action
 async def cmd_lineage(interaction: discord.Interaction):
-    pet, inv, meta, _ = get_or_create_user_pet(interaction.user.id)
+    await interaction.response.defer()
+    pet, inv, meta, _ = await asyncio.to_thread(get_or_create_user_pet, interaction.user.id)
     embed = create_lineage_embed(interaction.user, pet, meta)
     view = DamagochiView(interaction.user, pet, inv, meta, view_mode="lineage")
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.edit_original_response(embed=embed, view=view)
 
 @bot.tree.command(name="가방", description="🎒 내 인벤토리의 모든 아이템, 강화석, 장비 현황을 확인합니다.")
+@serialized_user_action
 async def cmd_bag(interaction: discord.Interaction):
-    pet, inv, meta, _ = get_or_create_user_pet(interaction.user.id)
+    await interaction.response.defer()
+    pet, inv, meta, _ = await asyncio.to_thread(get_or_create_user_pet, interaction.user.id)
     embed = create_bag_embed(interaction.user, pet, inv)
     view = DamagochiView(interaction.user, pet, inv, meta, view_mode="bag")
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.edit_original_response(embed=embed, view=view)
 
 @bot.tree.command(name="가이드", description="📖 [공식 가이드북] DAMAGOCHI v17.2 플레이어 가이드북을 확인합니다.")
 @app_commands.describe(챕터="열람할 가이드북 챕터 번호 (1~8장)")
@@ -3636,21 +3782,25 @@ async def cmd_guide(interaction: discord.Interaction, 챕터: app_commands.Choic
     await interaction.response.send_message(embed=embed, view=view)
 
 @bot.tree.command(name="스킬", description="⚔️ 현재 내 신수의 4대 고유 전투 스킬과 전용 보물 정보를 확인합니다.")
+@serialized_user_action
 async def cmd_skills(interaction: discord.Interaction):
-    pet, inv, meta, _ = get_or_create_user_pet(interaction.user.id)
+    await interaction.response.defer()
+    pet, inv, meta, _ = await asyncio.to_thread(get_or_create_user_pet, interaction.user.id)
     embed = create_skills_embed(interaction.user, pet, inv)
     view = DamagochiView(interaction.user, pet, inv, meta, view_mode="skills")
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.edit_original_response(embed=embed, view=view)
 
 @bot.tree.command(name="다시뽑기", description="🎲 [Lv.1 전용] 현재 1레벨인 신수를 새로운 운명의 알로 다시 부화합니다.")
+@serialized_user_action
 async def cmd_reroll(interaction: discord.Interaction):
-    pet, inv, meta, _ = get_or_create_user_pet(interaction.user.id)
+    await interaction.response.defer()
+    pet, inv, meta, _ = await asyncio.to_thread(get_or_create_user_pet, interaction.user.id)
     if pet.level > 1:
-        return await interaction.response.send_message("⚠️ 신수 다시 뽑기는 **Lv.1 초기 상태**에서만 가능합니다!", ephemeral=True)
+        return await send_deferred_ephemeral(interaction, "⚠️ 신수 다시 뽑기는 **Lv.1 초기 상태**에서만 가능합니다!")
     new_pet = Pet()
     new_inv = Inventory()
     new_inv.equipped_relic = {"species": new_pet.species_key, "level": 0}
-    save_user_pet(interaction.user.id, new_pet, new_inv, meta)
+    await asyncio.to_thread(save_user_pet, interaction.user.id, new_pet, new_inv, meta)
     
     shiny_str = "🌟 **[극희귀 황금 샤이니 변이 출현!]**\n" if new_pet.is_shiny else ""
     reroll_msg = (
@@ -3662,14 +3812,16 @@ async def cmd_reroll(interaction: discord.Interaction):
     embed, file_att = create_main_embed(interaction.user, new_pet, new_inv, reroll_msg, meta=meta)
     view = DamagochiView(interaction.user, new_pet, new_inv, meta, view_mode="main")
     attachments = [file_att] if file_att else []
-    await interaction.response.send_message(embed=embed, attachments=attachments, view=view)
+    await interaction.edit_original_response(embed=embed, attachments=attachments, view=view)
 
 @bot.tree.command(name="상점", description="🛒 24시 신수 편의 상점을 열어 돌봄/성장/치료 물품을 확인합니다.")
+@serialized_user_action
 async def cmd_shop(interaction: discord.Interaction):
-    pet, inv, meta, _ = get_or_create_user_pet(interaction.user.id)
+    await interaction.response.defer()
+    pet, inv, meta, _ = await asyncio.to_thread(get_or_create_user_pet, interaction.user.id)
     embed = create_shop_embed(interaction.user, pet, inv)
     view = DamagochiView(interaction.user, pet, inv, meta, view_mode="shop")
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.edit_original_response(embed=embed, view=view)
 
 @bot.tree.command(name="개발자인증", description="🔑 [관리자] 개발자 모드 보안 잠금/해제를 전환합니다.")
 @app_commands.describe(비밀번호="관리자 보안 비밀번호 (기본: 7777)")
@@ -3686,6 +3838,7 @@ async def cmd_dev_auth(interaction: discord.Interaction, 비밀번호: str):
         await interaction.response.send_message("🚫 **[인증 실패]** 관리자 비밀번호가 일치하지 않습니다.", ephemeral=True)
 
 @bot.tree.command(name="개발자모드", description="🛠️ 신수 스탯/장비/재화 디버그 및 관리자 치트 콘솔을 엽니다.")
+@serialized_user_action
 async def cmd_dev_mode(interaction: discord.Interaction):
     if DEV_MODE_LOCKED:
         return await interaction.response.send_message(
@@ -3693,10 +3846,11 @@ async def cmd_dev_mode(interaction: discord.Interaction):
             "채팅창에 **`/개발자인증 7777`**을 입력하여 잠금을 해제한 후 이용해 주세요! 💕",
             ephemeral=True
         )
-    pet, inv, meta, _ = get_or_create_user_pet(interaction.user.id)
+    await interaction.response.defer()
+    pet, inv, meta, _ = await asyncio.to_thread(get_or_create_user_pet, interaction.user.id)
     embed = create_dev_embed(interaction.user, pet, inv)
     view = DamagochiView(interaction.user, pet, inv, meta, view_mode="dev_mode")
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.edit_original_response(embed=embed, view=view)
 
 @bot.tree.command(name="신수설정", description="🛠️ [개발자] 신수의 종족/난이도MAX프리셋/레벨/장비/잠재 등을 자유 설정합니다.")
 @app_commands.describe(
@@ -3743,6 +3897,7 @@ async def cmd_dev_mode(interaction: discord.Interaction):
     app_commands.Choice(name="천계 갑주 (전설)", value="celestial_armor"),
     app_commands.Choice(name="고대신의 갑옷 (신화)", value="ancient_god_armor")
 ])
+@serialized_user_action
 async def cmd_custom_set(
     interaction: discord.Interaction,
     프리셋: app_commands.Choice[str] = None,
@@ -3765,7 +3920,8 @@ async def cmd_custom_set(
             "채팅창에 **`/개발자인증 7777`**을 입력하여 잠금을 해제한 후 이용해 주세요! 💕",
             ephemeral=True
         )
-    pet, inv, meta, _ = get_or_create_user_pet(interaction.user.id)
+    await interaction.response.defer()
+    pet, inv, meta, _ = await asyncio.to_thread(get_or_create_user_pet, interaction.user.id)
     logs = []
 
     if 프리셋 is not None:
@@ -3819,7 +3975,7 @@ async def cmd_custom_set(
         pet.coins = max(0, 골드)
         logs.append(f"• 골드: `{pet.coins:,}G`")
 
-    save_user_pet(interaction.user.id, pet, inv, meta)
+    await asyncio.to_thread(save_user_pet, interaction.user.id, pet, inv, meta)
     b_stats = pet.get_battle_stats(inv)
     
     desc = "🛠️ **[신수 커스텀 설정 완료!]**\n" + "\n".join(logs) if logs else "변경할 항목을 입력하지 않았습니다."
@@ -3828,9 +3984,10 @@ async def cmd_custom_set(
     
     embed = discord.Embed(title=f"🛠️ {pet.name} ({pet.species_name}) 스탯 커스텀 완료", description=desc, color=discord.Color.gold())
     view = DamagochiView(interaction.user, pet, inv, meta, view_mode="dev_mode")
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.edit_original_response(embed=embed, view=view)
 
 def main():
+    validate_backend_config()
     token = load_token()
     if not token or token == "YOUR_DISCORD_BOT_TOKEN_HERE":
         print(f"🚫 '{CONFIG_FILE}'에 유효한 디스코드 봇 토큰을 입력해 주세요.")

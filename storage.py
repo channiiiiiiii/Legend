@@ -7,32 +7,33 @@
 import os
 import json
 import time
+import threading
+
+from save_backend import SAVE_BACKEND
 
 STORAGE_FILE = os.path.join(os.path.dirname(__file__), "pet_storage.json")
+_STORAGE_LOCK = threading.RLock()
 
 class StorageManager:
     @staticmethod
-    def load_storage(user_id: str = "local") -> list:
-        if not os.path.exists(STORAGE_FILE):
-            return []
-        try:
-            with open(STORAGE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get(str(user_id), [])
-        except Exception:
-            return []
-
-    @staticmethod
-    def store_pet(pet_obj, user_id: str = "local") -> bool:
-        data = {}
-        if os.path.exists(STORAGE_FILE):
+    def load_storage(user_id: str = "local", meta: dict = None) -> list:
+        if meta is not None:
+            return list(meta.get("hall_of_fame", []))
+        if SAVE_BACKEND == "supabase":
+            raise RuntimeError("Supabase 운영에서는 meta['hall_of_fame']을 사용해야 합니다.")
+        with _STORAGE_LOCK:
+            if not os.path.exists(STORAGE_FILE):
+                return []
             try:
                 with open(STORAGE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except Exception:
-                data = {}
-        
-        user_list = data.get(str(user_id), [])
+                    return data.get(str(user_id), [])
+            except (OSError, json.JSONDecodeError, TypeError) as e:
+                print(f"[STORAGE LOAD ERROR] {type(e).__name__}: {e}")
+                return []
+
+    @staticmethod
+    def store_pet(pet_obj, user_id: str = "local", meta: dict = None) -> bool:
         if hasattr(pet_obj, "to_dict"):
             p_dict = pet_obj.to_dict()
         elif isinstance(pet_obj, dict):
@@ -41,15 +42,36 @@ class StorageManager:
             p_dict = {"name": str(pet_obj)}
 
         p_dict["stored_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        user_list.append(p_dict)
-        data[str(user_id)] = user_list
-        
-        try:
-            with open(STORAGE_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+
+        if meta is not None:
+            meta.setdefault("hall_of_fame", []).append(p_dict)
             return True
-        except Exception:
-            return False
+        if SAVE_BACKEND == "supabase":
+            raise RuntimeError("Supabase 운영에서는 meta['hall_of_fame']에 저장해야 합니다.")
+
+        with _STORAGE_LOCK:
+            data = {}
+            if os.path.exists(STORAGE_FILE):
+                try:
+                    with open(STORAGE_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (OSError, json.JSONDecodeError, TypeError) as e:
+                    print(f"[STORAGE LOAD ERROR] {type(e).__name__}: {e}")
+                    return False
+
+            user_list = data.get(str(user_id), [])
+            user_list.append(p_dict)
+            data[str(user_id)] = user_list
+
+            temp_path = f"{STORAGE_FILE}.tmp"
+            try:
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(temp_path, STORAGE_FILE)
+                return True
+            except (OSError, TypeError, ValueError) as e:
+                print(f"[STORAGE SAVE ERROR] {type(e).__name__}: {e}")
+                return False
 
 class PetMarket:
     @staticmethod

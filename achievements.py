@@ -511,8 +511,8 @@ class AchievementManager:
                             f"🏆 **[업적 달성!]** **「{ach['name']}」** 완료!\n"
                             f"└ 🏷️ 칭호 획득: **【{t_name}】** | 🌟 +{pts}점 | 💰 +{r_coins:,}G"
                         )
-                except Exception:
-                    pass
+                except (KeyError, TypeError, ValueError) as e:
+                    print(f"[ACHIEVEMENT ERROR] {type(e).__name__}: {e}")
 
         return new_logs
 

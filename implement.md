@@ -29,6 +29,29 @@
 
 ## 📝 진행 상황 로그 (누적 기록)
 
+### [2026-08-29] 🛡️ new.md 안정성 P0→P2 순차 구현
+1. [x] `SaveBackendUnavailable` 도입: Supabase 조회 오류는 예외, 정상 미존재만 `None` 반환
+2. [x] 손상 세이브 복원 실패도 신규 생성으로 진행하지 않고 저장 서버 오류로 중단
+3. [x] 레이드/던전/공통 버튼/DB Slash 명령에 defer 및 `asyncio.to_thread` 적용
+4. [x] 레이드 턴당 저장 1회 유지, 상태·보상·업적 확정 후 저장 및 Embed 생성
+5. [x] Supabase UPSERT 최대 3회 지수 백오프 및 최종 실패 성공 UI 차단
+6. [x] 운영 핵심 모듈의 예외 삼키기 제거와 구체적 Discord 예외 범위 적용
+7. [x] 재진입 가능한 사용자별 비동기 Lock으로 버튼·레이드·Slash 상태변경 직렬화
+8. [x] Supabase 운영에서 로컬 `pet_storage.json` 접근 금지, 사용자 `meta["hall_of_fame"]` 사용
+9. [x] `v17→v18` 단계형 마이그레이션 및 미래 버전 강제 다운그레이드 방지
+10. [x] Supabase 환경변수 시작 전 검증, `/health`의 Discord/저장 설정 상태 분리
+11. [x] `deploy.ps1`에 지정 Home Python 및 필수 9개 파일 누락/문법 preflight 적용
+12. [x] 단계별 `py_compile`, 장애/재시도/Lock/meta 저장/마이그레이션 모의 테스트 통과
+
+### [2026-08-29] 🚨 레이드 Discord Interaction ACK/Supabase I/O 긴급 수정
+1. [x] `HybridBattleView.handle_action()`의 사용자 ID 검사 직후 `await interaction.response.defer()`를 배치하여 Discord 초기 응답 제한 내 ACK 보장
+2. [x] 동기 Supabase 저장을 `await asyncio.to_thread(save_user_pet, ...)`로 분리하여 비동기 이벤트 루프 블로킹 제거
+3. [x] 턴 시작 직후 및 승리/패배 분기의 중복 저장을 제거하고, 모든 상태 정산 후 턴당 정확히 1회 저장하도록 통합
+4. [x] defer 이후 메시지 갱신을 `interaction.edit_original_response()`로 일원화
+5. [x] `except Exception: pass` 제거 후 `[RAID ERROR]` 로그, traceback, ephemeral 후속 오류 응답 추가
+6. [x] 강제 Home Python 경로로 `discord_bot.py -m py_compile` 구문 검사 통과
+7. [!] `test_damagochi.py`는 레이드와 무관한 장비 제작 검증의 `assert suc`에서 실패하여 기존 회귀 이슈로 기록
+
 ### [2026-08-29] 🚀💾 v18 「Supabase DB 이전 + Render 무료 배포 통합」 코드 구현 완료
 1. [x] **💾 `save_backend.py` 신규 모듈 구현 (DB 전용 세이브 매니저):**
    - JSON(로컬) / Supabase(운영) 듀얼 백엔드 통합 인터페이스
@@ -53,6 +76,13 @@
 5. [x] **🧪 로컬 JSON 백엔드 통합 테스트 ALL PASS:**
    - Backend Info: JSON | Version: v18
    - Load/Save/save_version 태깅 정상 검증 완료
+6. [x] **🔌 Supabase DB 연동 및 유저 세이브 100% 마이그레이션 완료:**
+   - `migrate_json_to_supabase.py` 실행 완료: 총 2명 유저 데이터 (Lv.18 암흑늑대, Lv.22 수호드래곤) 완벽 이전
+   - `test_supabase_e2e.py` 검증: Supabase 로드/저장/전투 스탯 매트릭스 계산 ALL PASS
+7. [x] **🌐 GitHub 원격 저장소(`main`) 배포 완료:**
+   - 레포지토리: `https://github.com/channiiiiiiii/Legend`
+   - 커밋: `f4fde1c v18: Supabase DB saves + Render free deployment + aiohttp health server`
+   - 민감정보(`.env`, `bot_config.json`, `node_modules/`, `discord_saves/`) 완전 격리
 
 ### [2026-08-28] 🛡️👑 v17.2 「던전 · 레이드 · 방어구 · 보물 성장 시스템 통합 개편」 완료
 1. [x] **🌲 던전 vs 👑 레이드 역할 분리:**
