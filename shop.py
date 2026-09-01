@@ -5,6 +5,7 @@
 """
 
 import random
+from farming import normalize_inventory
 
 # 10대 종족 전용 보물 데이터베이스 (공식 명칭 및 +0 ~ +10 스탯 & +10 고유 효과)
 EXCLUSIVE_RELICS = {
@@ -176,6 +177,12 @@ class Inventory:
         self.relics_inventory = [] # list of {"species": "호랑이", "level": 0}
         self.armors_inventory = [] # list of {"armor_id": "mythic_dragon_armor", "level": 0, "opt": ...}
         self.species_essences = {} # {"호랑이": 10, "드래곤": 5, ...}
+        self.relic_engravings = []
+        self.armor_engravings = []
+        self.relic_engraving_locks = []
+        self.armor_engraving_locks = []
+        self.gems = {}
+        self.equipped_gems = {}
         
         migration_map = {
             "ancient_god_armor": "mythic_celestial_armor",
@@ -204,6 +211,7 @@ class Inventory:
         else:
             self.items = {"small_candy": 3, "armor_stone": 5}
             self.species_essences = {}
+        normalize_inventory(self, data)
 
     def to_dict(self) -> dict:
         return {
@@ -212,7 +220,13 @@ class Inventory:
             "equipped_armor": self.equipped_armor,
             "relics_inventory": self.relics_inventory,
             "armors_inventory": self.armors_inventory,
-            "species_essences": self.species_essences
+            "species_essences": self.species_essences,
+            "relic_engravings": self.relic_engravings,
+            "armor_engravings": self.armor_engravings,
+            "relic_engraving_locks": self.relic_engraving_locks,
+            "armor_engraving_locks": self.armor_engraving_locks,
+            "gems": self.gems,
+            "equipped_gems": self.equipped_gems
         }
 
     def add_item(self, item_id: str, count: int = 1):

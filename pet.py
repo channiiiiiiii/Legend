@@ -8,6 +8,7 @@ import random
 import time
 from species import Genetics, SPECIES_DATABASE, PERSONALITIES
 from shop import EXCLUSIVE_RELICS, ARMORS_DATABASE
+from farming import stat_bonus
 
 ASCII_ARTS = {
     "드래곤": {
@@ -754,6 +755,14 @@ class Pet:
         defence = int(base_def * def_iv_mult * (1 + self.level * 0.05) * def_mult * shiny_mult * trans_mult * p_def_mult * hunger_def_mult * happy_all_mult * pot_def_mult * (1.0 + opt_def_pct)) + relic_def + armor_def
         spd = int(base_spd * spd_iv_mult * (1 + self.level * 0.03) * spd_mult * shiny_mult * trans_mult * p_spd_mult * happy_spd_mult * happy_all_mult * pot_spd_mult * (1.0 + opt_spd_pct)) + relic_spd + armor_spd
         crit = int((base_crit * crit_iv_mult * (1 + self.level * 0.03) * crit_mult * shiny_mult * aff_bonus + p_crit_mod) * trans_mult * happy_crit_mult * happy_all_mult * pot_crit_mult) + relic_crit
+
+        # 각인과 장착 보석은 가이드 명세대로 최종 절대 스탯에 더한다.
+        farming_bonus = stat_bonus(inventory) if inventory else {key: 0 for key in ("hp", "atk", "def", "spd", "crit")}
+        max_hp += farming_bonus["hp"]
+        atk += farming_bonus["atk"]
+        defence += farming_bonus["def"]
+        spd += farming_bonus["spd"]
+        crit += farming_bonus["crit"]
         
         f_max_hp = max(100, max_hp)
         f_cur_hp = max(10, int(f_max_hp * (self.health / 100.0)))

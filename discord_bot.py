@@ -40,6 +40,11 @@ from adventure import (
 )
 from achievements import AchievementManager, ACHIEVEMENTS_DATABASE
 from storage import StorageManager, PetMarket
+from farming import (
+    GEM_TYPES, GEM_VALUES, GRADE_NAMES, TIER_NAMES, equip_gem,
+    reroll_engraving, roll_stone_drop, stage_skill_profile,
+    stone_item_id, synthesize_gem, toggle_lock,
+)
 from save_backend import (
     SaveBackendUnavailable, load_user_save, save_user_save,
     delete_user_save, get_backend_info, validate_backend_config, SAVE_BACKEND
@@ -764,6 +769,47 @@ def create_bag_embed(user: discord.User, pet: Pet, inv: Inventory) -> discord.Em
     embed.add_field(name="🎒 장비 장착 및 보관함", value=f"{relic_str}\n{armor_str}{other_txt}", inline=False)
 
     embed.set_footer(text="신수키우기 v1.0 💖 | [🔙 메인으로] 버튼으로 복귀")
+    return embed
+
+def create_farming_embed(user: discord.User, pet: Pet, inv: Inventory, kind: str = "main") -> discord.Embed:
+    """각인과 보석을 한곳에서 확인하는 파밍 관리 화면."""
+    names = {"hp": "HP", "atk": "ATK", "def": "DEF", "spd": "SPD", "crit": "CRIT"}
+    embed = discord.Embed(
+        title=f"���� {user.display_name}님의 파밍 관리소",
+        description="각인 3줄은 옵션 중복 없이 재설정되며, 잠근 다른 줄 수에 따라 1/4/9개가 소모됩니다.",
+        color=discord.Color.purple(), timestamp=datetime.now()
+    )
+    if kind in ("main", "relic", "armor"):
+        kinds = ("relic", "armor") if kind == "main" else (kind,)
+        for target in kinds:
+            rows = getattr(inv, f"{target}_engravings")
+            locks = getattr(inv, f"{target}_engraving_locks")
+            lines = []
+            for idx, row in enumerate(rows):
+                lock = "����" if locks[idx] else "����"
+                if row:
+                    label = names.get(row["option"], row["option"])
+                    lines.append(f"{idx + 1}. {lock} **{label} +{row['value']}** ({GRADE_NAMES[row['grade']]})")
+                else:
+                    lines.append(f"{idx + 1}. {lock} `미설정`")
+            title = "���� 보물 각인" if target == "relic" else "����️ 방어구 각인"
+            embed.add_field(name=title, value="\n".join(lines), inline=False)
+    if kind in ("main", "gems"):
+        lines = []
+        for gem_type in GEM_TYPES:
+            owned = [f"Lv.{level}×{inv.gems[gem_type][str(level)]}" for level in range(1, 11) if inv.gems[gem_type][str(level)] > 0]
+            equipped = inv.equipped_gems.get(gem_type, 0)
+            bonus = GEM_VALUES[gem_type][equipped - 1] if equipped else 0
+            lines.append(f"**{names[gem_type]}** 장착 Lv.{equipped or 0} (+{bonus}) | {', '.join(owned) if owned else '없음'}")
+        embed.add_field(name="���� 보석", value="\n".join(lines), inline=False)
+    stones = []
+    for target in ("relic", "armor"):
+        for tier, tier_name in TIER_NAMES.items():
+            count = inv.items.get(stone_item_id(target, tier), 0)
+            if count:
+                stones.append(f"{target}/{tier_name}: {count}")
+    embed.add_field(name="���� 각인석", value=" | ".join(stones) if stones else "보유 각인석 없음", inline=False)
+    embed.set_footer(text="재설정과 합성 결과는 즉시 저장됩니다.")
     return embed
 
 def create_shop_embed(user: discord.User, pet: Pet, inv: Inventory = None) -> discord.Embed:
@@ -1634,6 +1680,7 @@ class HybridBattleSession:
         
         self.sp_key = getattr(pet, "species_key", "호랑이")
         self.skills = SPECIES_SKILLS.get(self.sp_key, SPECIES_SKILLS["호랑이"])
+        self.stage_skill = stage_skill_profile(get_growth_stage(self.pet.level), getattr(self.pet, "role", ""))
         
         if self.sp_key == "기린":
             self.p_max_hp = int(self.p_max_hp * 1.03)
@@ -1869,7 +1916,7 @@ class HybridBattleSession:
             logs.append(f"🛡️ **{self.pet.name}**이(가) 방어 태세를 취했습니다! (이번 턴 받는 피해 -40% & 궁극 패턴 완충)")
 
         if skill_info and self.p_hp > 0:
-            ratio = skill_info.get("atk_ratio", 1.0)
+            ratio = skill_info.get("atk_ratio", 1.0) * self.stage_skill["damage_mult"]
             if self.armor_first_hit > 0 and self.turn == 1 and self.p_spd > self.b_spd:
                 ratio *= (1.0 + self.armor_first_hit)
                 logs.append("🌪️⚡ **[천풍의 경갑]** 선공 첫 타 피해가 +7% 증폭되었습니다!")
@@ -2433,6 +2480,11 @@ class HybridBattleView(discord.ui.View):
                         self.meta["cleared_bosses"] = c_bosses
 
                 ach_logs = AchievementManager.check_and_claim(self.session.pet, self.session.inv, self.meta)
+                engraving_stone = roll_stone_drop(
+                    self.session.inv, self.session.pet, "relic", min(4, diff_id)
+                )
+                if engraving_stone:
+                    drop_logs.append(f"🎴 **보물 각인석** `{engraving_stone}` +1개")
                 
                 drop_str = f"\n📦 **핵심 드랍:**\n• " + "\n• ".join(drop_logs) if drop_logs else ""
                 clear_gate_str = ("\n\n" + "\n".join(clear_logs)) if clear_logs else ""
@@ -2596,7 +2648,29 @@ class DamagochiView(discord.ui.View):
             self.add_item(discord.ui.Button(label="🍬 사탕 먹이기", style=discord.ButtonStyle.primary, custom_id="btn_bag_use_candy", row=0))
             self.add_item(discord.ui.Button(label="💊 치료약 사용", style=discord.ButtonStyle.success, custom_id="btn_bag_cure", row=0))
             self.add_item(discord.ui.Button(label="⚒️ 장비 대장간 (강화/승급)", style=discord.ButtonStyle.danger, custom_id="btn_bag_upgrade", row=0))
+            self.add_item(discord.ui.Button(label="💎 각인·보석 파밍", style=discord.ButtonStyle.primary, custom_id="btn_nav_farming", row=1))
             self.add_item(discord.ui.Button(label="↩️ 메인으로", style=discord.ButtonStyle.secondary, custom_id="btn_back_main", row=1))
+
+        elif self.view_mode == "farming":
+            self.add_item(discord.ui.Button(label="🎴 보물 각인", style=discord.ButtonStyle.primary, custom_id="btn_farming_relic", row=0))
+            self.add_item(discord.ui.Button(label="🛡️ 방어구 각인", style=discord.ButtonStyle.success, custom_id="btn_farming_armor", row=0))
+            self.add_item(discord.ui.Button(label="💠 보석 합성·장착", style=discord.ButtonStyle.secondary, custom_id="btn_farming_gems", row=0))
+            self.add_item(discord.ui.Button(label="↩️ 가방으로", style=discord.ButtonStyle.secondary, custom_id="btn_back_bag", row=1))
+
+        elif self.view_mode in ("farming_relic", "farming_armor"):
+            kind = self.view_mode.split("_")[1]
+            locks = getattr(self.inv, f"{kind}_engraving_locks")
+            for slot in range(3):
+                self.add_item(discord.ui.Button(label=f"🎲 {slot + 1}번 재설정", style=discord.ButtonStyle.primary, custom_id=f"btn_farm_roll_{kind}_{slot}", row=0))
+                lock_label = "🔓 잠금 해제" if locks[slot] else "🔒 잠금"
+                self.add_item(discord.ui.Button(label=f"{slot + 1}번 {lock_label}", style=discord.ButtonStyle.secondary, custom_id=f"btn_farm_lock_{kind}_{slot}", row=1))
+            self.add_item(discord.ui.Button(label="↩️ 파밍 관리로", style=discord.ButtonStyle.secondary, custom_id="btn_nav_farming", row=2))
+
+        elif self.view_mode == "farming_gems":
+            gem_labels = {"hp": "❤️ HP", "atk": "⚔️ ATK", "def": "🛡️ DEF", "spd": "⚡ SPD", "crit": "🎯 CRIT"}
+            for gem_type in GEM_TYPES:
+                self.add_item(discord.ui.Button(label=f"{gem_labels[gem_type]} 합성·최고장착", style=discord.ButtonStyle.primary, custom_id=f"btn_farm_gem_{gem_type}", row=0))
+            self.add_item(discord.ui.Button(label="↩️ 파밍 관리로", style=discord.ButtonStyle.secondary, custom_id="btn_nav_farming", row=1))
 
         # 4-1. ⚒️ [장비 대장간 / 강화소] 서브메뉴 (v17.2)
         elif self.view_mode == "forge":
@@ -2747,7 +2821,7 @@ class DamagochiView(discord.ui.View):
             self.add_item(discord.ui.Button(label="↩️ 뒤로 가기", style=discord.ButtonStyle.secondary, custom_id="btn_back_prev", row=0))
             self.add_item(discord.ui.Button(label="🏠 메인으로", style=discord.ButtonStyle.primary, custom_id="btn_back_main", row=0))
 
-    async def update_view(self, interaction: discord.Interaction, action_msg: str = ""):
+    async def update_view(self, interaction: discord.Interaction, action_msg: str = "") -> bool:
         if not interaction.response.is_done():
             await interaction.response.defer()
         async with USER_ACTION_QUEUE.get_lock(self.user.id):
@@ -2765,7 +2839,7 @@ class DamagochiView(discord.ui.View):
             if not await save_user_pet_or_notify(
                 interaction, self.user.id, self.pet, self.inv, self.meta
             ):
-                return
+                return False
             self.rebuild_ui()
             
             file_att = None
@@ -2777,6 +2851,9 @@ class DamagochiView(discord.ui.View):
                 embed = create_lineage_embed(self.user, self.pet, self.meta)
             elif self.view_mode == "bag":
                 embed = create_bag_embed(self.user, self.pet, self.inv)
+            elif self.view_mode.startswith("farming"):
+                kind = self.view_mode.removeprefix("farming_") if self.view_mode != "farming" else "main"
+                embed = create_farming_embed(self.user, self.pet, self.inv, kind)
             elif self.view_mode == "forge":
                 embed = create_forge_embed(self.user, self.pet, self.inv)
             elif self.view_mode == "shop":
@@ -2840,6 +2917,7 @@ class DamagochiView(discord.ui.View):
             except Exception as e:
                 import traceback
                 traceback.print_exc()
+            return True
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         async with USER_ACTION_QUEUE.get_lock(interaction.user.id):
@@ -2866,6 +2944,47 @@ class DamagochiView(discord.ui.View):
         elif c_id == "btn_nav_bag":
             self.view_mode = "bag"
             await self.update_view(interaction, "🎒 가방(인벤토리) 메뉴로 이동했습니다.")
+        elif c_id == "btn_nav_farming":
+            self.view_mode = "farming"
+            await self.update_view(interaction)
+        elif c_id in ("btn_farming_relic", "btn_farming_armor", "btn_farming_gems"):
+            self.view_mode = c_id.removeprefix("btn_")
+            await self.update_view(interaction)
+        elif c_id.startswith("btn_farm_lock_"):
+            await interaction.response.defer()
+            _, _, _, kind, slot_text = c_id.split("_")
+            snapshot = self.inv.to_dict()
+            slot = int(slot_text)
+            if not toggle_lock(self.inv, kind, slot):
+                return await interaction.followup.send("⚠️ 먼저 해당 각인을 설정해 주세요.", ephemeral=True)
+            locked = getattr(self.inv, f"{kind}_engraving_locks")[slot]
+            if not await self.update_view(interaction, f"{'🔒 잠금' if locked else '🔓 잠금 해제'} 완료"):
+                self.inv = Inventory(snapshot)
+        elif c_id.startswith("btn_farm_roll_"):
+            await interaction.response.defer()
+            _, _, _, kind, slot_text = c_id.split("_")
+            snapshot = self.inv.to_dict()
+            slot = int(slot_text)
+            tier = next((value for value in range(4, 0, -1) if self.inv.items.get(stone_item_id(kind, value), 0) > 0), 1)
+            success, result = reroll_engraving(self.inv, kind, slot, tier)
+            if not success:
+                return await interaction.followup.send(f"⚠️ 각인 재설정 실패: {result}", ephemeral=True)
+            if not await self.update_view(interaction, f"✨ {slot + 1}번 각인이 재설정되었습니다."):
+                self.inv = Inventory(snapshot)
+        elif c_id.startswith("btn_farm_gem_"):
+            await interaction.response.defer()
+            gem_type = c_id.removeprefix("btn_farm_gem_")
+            snapshot = self.inv.to_dict()
+            source = next((level for level in range(1, 10) if self.inv.gems[gem_type][str(level)] >= 2), None)
+            if source is not None:
+                synthesize_gem(self.inv, gem_type, source)
+            highest = next((level for level in range(10, 0, -1) if self.inv.gems[gem_type][str(level)] > 0), None)
+            if highest is None or not equip_gem(self.inv, gem_type, highest):
+                return await interaction.followup.send("⚠️ 합성하거나 장착할 보석이 없습니다.", ephemeral=True)
+            message = f"💠 Lv.{source} 보석 2개를 Lv.{source + 1}로 합성하고 " if source else "💠 "
+            message += f"Lv.{highest} 보석을 장착했습니다."
+            if not await self.update_view(interaction, message):
+                self.inv = Inventory(snapshot)
         elif c_id == "btn_nav_growth":
             self.view_mode = "growth"
             await self.update_view(interaction, "🧬 성장 및 혈통 메뉴로 이동했습니다.")

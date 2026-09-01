@@ -5,6 +5,7 @@
 """
 
 import random
+from farming import roll_gem_drop, roll_stone_drop
 import time
 from shop import EXCLUSIVE_RELICS, ARMORS_DATABASE
 from species import PERSONALITIES, SPECIES_SKILLS
@@ -1128,6 +1129,13 @@ class AdventureSystem:
             tot_gold += run_g
             tot_exp += run_e
 
+            farming_tier = max(1, min(4, diff_id))
+            stone_id = roll_stone_drop(inventory, pet, "armor", farming_tier)
+            if stone_id:
+                dropped_items.append(f"🛡️ 방어구 각인석 ({stone_id})")
+            gem_type, gem_level = roll_gem_drop(inventory, max(1, min(5, diff_id)))
+            dropped_items.append(f"💎 {gem_type.upper()} 보석 Lv.{gem_level}")
+
             # 재료 드랍 배율 반영 (정예 1.5x, 심연 2.0x)
             m_mult = diff_info["mat_mult"]
 
@@ -1216,5 +1224,4 @@ class AdventureSystem:
             result_msg += "\n" + " ".join(aff_logs)
 
         return True, result_msg
-
 
