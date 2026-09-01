@@ -39,6 +39,14 @@
 - [x] 단계별 및 전체 `py_compile`, 핵심 도메인 테스트, 봇 import 검증 통과
 - [ ] Render 배포 및 운영 봇 확인 (이번 작업 범위에서 미실행)
 
+## 🚦 2026-09-01 Discord 로그인 429 복구
+- [x] Render 로그에서 `/users/@me` static login 글로벌 429를 직접 원인으로 확정
+- [x] Discord 로그인 전에 `/health` 서버를 시작해 대기 중 Render 프로세스 종료 방지
+- [x] `Retry-After`와 60초→최대 15분 지수 백오프를 함께 적용
+- [x] 429에서 프로세스를 종료하지 않고 동일 프로세스 안에서 로그인 재시도
+- [x] 지정 Home Python `py_compile` 및 백오프 계산 테스트 통과
+- [ ] 변경 커밋·Push 후 Render 재배포 및 `discord=ready` 확인
+
 ## ✅ 완료 체크리스트
 
 ### 코드 구현 및 DB 연동 (STEP 1~17)

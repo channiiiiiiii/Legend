@@ -4105,13 +4105,47 @@ async def cmd_custom_set(
     view = DamagochiView(interaction.user, pet, inv, meta, view_mode="dev_mode")
     await interaction.edit_original_response(embed=embed, view=view)
 
+def get_discord_retry_after(error: discord.HTTPException, attempt: int) -> float:
+    """Discord 429 헤더와 재시도 횟수를 반영한 로그인 대기 시간."""
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        retry_after = float(headers.get("Retry-After", 0))
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    exponential_delay = min(900.0, 60.0 * (2 ** min(attempt, 4)))
+    return max(retry_after, exponential_delay)
+
+
+async def run_bot_with_login_backoff(token: str):
+    # 잡지식: health 포트를 먼저 열면 로그인 대기 중에도 Render가 프로세스를 죽이지 않습니다.
+    await start_health_server()
+    attempt = 0
+    while True:
+        try:
+            await bot.start(token, reconnect=True)
+            return
+        except discord.HTTPException as e:
+            if getattr(e, "status", None) != 429:
+                raise
+            delay = get_discord_retry_after(e, attempt)
+            attempt += 1
+            print(
+                f"[DISCORD LOGIN RATE LIMIT] {delay:.1f}초 후 재시도 "
+                f"(attempt={attempt}, status=429)",
+                flush=True
+            )
+            await asyncio.sleep(delay)
+
+
 def main():
     validate_backend_config()
     token = load_token()
     if not token or token == "YOUR_DISCORD_BOT_TOKEN_HERE":
         print(f"🚫 '{CONFIG_FILE}'에 유효한 디스코드 봇 토큰을 입력해 주세요.")
         return
-    bot.run(token)
+    discord.utils.setup_logging()
+    asyncio.run(run_bot_with_login_backoff(token))
 
 if __name__ == "__main__":
     main()
